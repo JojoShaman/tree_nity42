@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	"treenity/protocol"
 )
 
@@ -23,7 +24,9 @@ const ServerFifoPath = "/tmp/treenity.server."
 const ReplyFifoPath = "/tmp/treenity.reply."
 
 type Server struct {
-	topics map[string]*Topic
+	topics  map[string]*Topic
+	clients *Hashtable
+	IPC     string
 }
 
 type Message struct {
@@ -63,18 +66,63 @@ func waitRequest(ch chan protocol.Request, f io.Reader) {
 	}
 }
 
+func handleSubscribe(r protocol.SubscribeReq, s *Server) {
+	if _, exists := s.topics[r.Topic]; !exists {
+		Reply(r.PID,
+			int(protocol.StatusClient),
+			"topic: not found")
+		return
+	}
+	clientIPC := fmt.Sprintf("%s.%s", s.IPC, r.Name)
+	client := s.clients.Get(r.Name)
+	if client == nil {
+		client = &ClientMeta{
+			Name:      r.Name,
+			Topic:     r.Topic,
+			Prefix:    r.Prefix,
+			IPC:       clientIPC,
+			Connected: true,
+			LastSeen:  time.Now(),
+		}
+		if r.HassOffset {
+			client.Offset = r.Offset
+		}
+		s.clients.Insert(client)
+	} else {
+		if client.Connected {
+			Reply(r.PID,
+				int(protocol.StatusClient),
+				"client already connected")
+			return
+		} else {
+			offset := client.Offset
+			if r.HassOffset {
+				offset = r.Offset
+			} else {
+				if r.Topic != client.Topic {
+					offset = 0
+				}
+			}
+			client.Prefix = r.Prefix
+			client.Topic = r.Topic
+			client.Offset = offset
+			client.Connected = true
+			client.LastSeen = time.Now()
+		}
+	}
+}
+
 func run() error {
-	fifoPath := fmt.Sprintf(
+	server := Server{topics: make(map[string]*Topic)}
+	server.IPC = fmt.Sprintf(
 		"%s%d", ServerFifoPath, uint32(os.Getpid()))
-	os.Remove(fifoPath)
-	defer os.Remove(fifoPath)
-	syscall.Mkfifo(fifoPath, 0666)
-	fmt.Println(fifoPath)
-	server := Server{
-		topics: make(map[string]*Topic)}
+	os.Remove(server.IPC)
+	defer os.Remove(server.IPC)
+	syscall.Mkfifo(server.IPC, 0666)
+	fmt.Println(server.IPC)
 	sigCh := make(chan os.Signal, 1)
 	reqCh := make(chan protocol.Request, 1)
-	if f, err := os.OpenFile(fifoPath, os.O_RDWR, 0); err != nil {
+	if f, err := os.OpenFile(server.IPC, os.O_RDWR, 0); err != nil {
 		return err
 	} else {
 		defer f.Close()
@@ -97,6 +145,8 @@ loop:
 					break
 				}
 				t.messages <- r
+			case protocol.SubscribeReq:
+				handleSubscribe(r, &server)
 			default:
 			}
 		case <-sigCh:
